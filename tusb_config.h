@@ -13,6 +13,11 @@
 #define CFG_TUD_ENABLED       1
 #define CFG_TUD_MAX_SPEED     OPT_MODE_DEFAULT_SPEED  // Full Speed (12 Mbit/s)
 
+// Endpoint 0 packet size — MUST be 64 for Full Speed USB.
+// Used in bMaxPacketSize0 of the device descriptor.
+// Missing this causes bMaxPacketSize0 = 0 and enumeration failure.
+#define CFG_TUD_ENDPOINT0_SIZE  64
+
 // CDC ACM: 1 interface
 #define CFG_TUD_CDC     1
 #define CFG_TUD_MSC     0

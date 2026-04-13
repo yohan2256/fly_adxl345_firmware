@@ -263,18 +263,25 @@ int main(void)
     // Requires usb_descriptors.c + tusb_config.h
     tusb_init();
 
-    // SPI init — must complete BEFORE multicore_launch_core1
+    // SPI + GPIO init
     spi_init(SPI_PORT, 5000u * 1000u);  // 5 MHz
     spi_set_format(SPI_PORT, 8, SPI_CPOL_1, SPI_CPHA_1, SPI_MSB_FIRST);
     gpio_set_function(PIN_MISO, GPIO_FUNC_SPI);
     gpio_set_function(PIN_SCK,  GPIO_FUNC_SPI);
     gpio_set_function(PIN_MOSI, GPIO_FUNC_SPI);
-
     gpio_init(PIN_CS);
     gpio_set_dir(PIN_CS, GPIO_OUT);
     gpio_put(PIN_CS, 1);
 
-    sleep_ms(100);  // power-on settle
+    // Power-on settle: call tud_task() every 1 ms for 100 ms.
+    // USB enumeration starts immediately after tusb_init() — the host sends
+    // SETUP/GET_DESCRIPTOR requests within the first few ms.
+    // A plain sleep_ms(100) would leave those requests unanswered and
+    // cause enumeration failure (no COM port on host side).
+    for (int i = 0; i < 100; i++) {
+        tud_task();
+        sleep_ms(1);
+    }
 
     // ADXL345 config
     write_register(REG_DATA_FORMAT, 0x0Bu);                             // FULL_RES +/-16g
