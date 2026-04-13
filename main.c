@@ -4,7 +4,8 @@
  * IMPROVED:
  *   - Dual-core: Core 0 = USB service, Core 1 = sensor read
  *   - 8 KB SPSC ring buffer (lock-free) decouples sensor from USB
- *   - Direct TinyUSB (no stdio_usb) → non-blocking writes
+ *   - stdio_usb (pico_enable_stdio_usb 1) for guaranteed COM port recognition
+ *   - Direct tud_cdc_write() for non-blocking data output
  *   - Batch flush (256 B threshold) for Android USB efficiency
  *   - Adaptive sleep based on FIFO fill level
  *   - flags bit1: ring-buffer drop indicator for receiver
@@ -149,18 +150,22 @@ static uint16_t crc16_ccitt(const uint8_t *data, size_t len)
 // ===========================================================================
 // Core 0: USB service
 //
-// tud_task() MUST run on Core 0 (USB IRQ bound to Core 0).
-// tud_cdc_write() puts data into TinyUSB's internal TX FIFO (non-blocking).
-// tud_cdc_write_flush() marks the FIFO as ready for the next USB transfer.
+// tud_task() is called here AND by the SDK's background worker — both are
+// safe on RP2040 because the USB IRQ handler is not re-entrant with the
+// main-loop tud_task() (IRQ fires dcd_int_handler, not tud_task).
 //
-// Batch-flush strategy: accumulate USB_FLUSH_BYTES before flushing.
-// Fewer USB transactions => better throughput on Android (1 ms polling).
+// Data is written via tud_cdc_write() directly (non-blocking) rather than
+// fwrite/fflush. Since we never call printf/fwrite after init, the stdio_usb
+// mutex is never held, so direct tud_cdc_write() calls are safe.
+//
+// Batch-flush: accumulate USB_FLUSH_BYTES before flushing to reduce USB
+// transaction count — important for Android (1 ms polling interval).
 // ===========================================================================
 #define USB_FLUSH_BYTES 256u
 
 static void usb_service(void)
 {
-    tud_task();     // TinyUSB event processing (mandatory, Core 0 only)
+    tud_task();     // TinyUSB event processing
 
     if (!tud_cdc_connected()) return;
 
@@ -170,12 +175,11 @@ static void usb_service(void)
 
     uint32_t avail = tud_cdc_write_available();
     if (chunk > avail) chunk = avail;
-    if (!chunk) return;             // TinyUSB TX FIFO full — retry next call
+    if (!chunk) return;             // CDC TX full — retry next call
 
     uint32_t written = tud_cdc_write(ptr, chunk);
     ring_consume(written);
 
-    // Flush when ring drained or TinyUSB TX FIFO is nearly full
     if (ring_used() == 0 || tud_cdc_write_available() < USB_FLUSH_BYTES)
         tud_cdc_write_flush();
 }
@@ -196,7 +200,6 @@ static void core1_sensor_loop(void)
     uint32_t drop_count = 0;
 
     while (true) {
-        // ---- Poll FIFO status ----
         uint8_t fifo_status = 0;
         read_registers(REG_FIFO_STATUS, &fifo_status, 1);
         uint8_t entries = fifo_status & 0x3Fu;
@@ -207,12 +210,10 @@ static void core1_sensor_loop(void)
             continue;
         }
 
-        // ---- Read samples (6 bytes per call = 1 FIFO sample popped) ----
         uint8_t n = (entries > MAX_SAMPLES_FRAME) ? MAX_SAMPLES_FRAME : entries;
         for (uint8_t i = 0; i < n; i++)
             read_one_xyz6(&raw[6 * i]);
 
-        // ---- Build frame ----
         frame_header_t hdr = {
             .sync1     = 0xFA,
             .sync2     = 0xCE,
@@ -238,19 +239,15 @@ static void core1_sensor_loop(void)
         frame_buf[off++] = (uint8_t)(crc & 0xFFu);
         frame_buf[off++] = (uint8_t)(crc >> 8u);
 
-        // ---- Push to ring buffer (non-blocking, never stalls) ----
         if (!ring_push(frame_buf, (uint32_t)off))
-            drop_count++;   // ring full: USB host too slow
+            drop_count++;
         else
             drop_count = 0;
 
         seq_tx += n;
 
-        // ---- Adaptive sleep ----
-        // Overrun or FIFO nearly full: no sleep, drain immediately
-        // Otherwise: halved sleep to reduce busy-loop overhead
         if (!overrun && entries <= FIFO_WATERMARK + 4u)
-            sleep_us(LOOP_SLEEP_US / 2u);   // 200 -> 100 us
+            sleep_us(LOOP_SLEEP_US / 2u);
     }
 }
 
@@ -259,9 +256,11 @@ static void core1_sensor_loop(void)
 // ===========================================================================
 int main(void)
 {
-    // TinyUSB init (replaces stdio_init_all + stdio_usb)
-    // Requires usb_descriptors.c + tusb_config.h
-    tusb_init();
+    // stdio_init_all() initialises USB CDC through pico_enable_stdio_usb.
+    // This uses the Pico SDK's built-in USB descriptor stack (same VID/PID
+    // and class codes as standard Pico firmware) — guaranteed COM port
+    // recognition on Windows, macOS, Linux, and Android without extra drivers.
+    stdio_init_all();
 
     // SPI + GPIO init
     spi_init(SPI_PORT, 5000u * 1000u);  // 5 MHz
@@ -273,11 +272,8 @@ int main(void)
     gpio_set_dir(PIN_CS, GPIO_OUT);
     gpio_put(PIN_CS, 1);
 
-    // Power-on settle: call tud_task() every 1 ms for 100 ms.
-    // USB enumeration starts immediately after tusb_init() — the host sends
-    // SETUP/GET_DESCRIPTOR requests within the first few ms.
-    // A plain sleep_ms(100) would leave those requests unanswered and
-    // cause enumeration failure (no COM port on host side).
+    // Power-on settle: call tud_task() every 1 ms so USB enumeration
+    // requests from the host are answered promptly during startup.
     for (int i = 0; i < 100; i++) {
         tud_task();
         sleep_ms(1);
@@ -292,7 +288,7 @@ int main(void)
     // Launch Core 1 (sensor read; SPI exclusive to Core 1 from here)
     multicore_launch_core1(core1_sensor_loop);
 
-    // Core 0: USB tight loop — no sleep (tud_task needs frequent calls)
+    // Core 0: USB tight loop
     while (true) {
         usb_service();
     }
