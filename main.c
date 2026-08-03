@@ -8,6 +8,12 @@
  *   - Batch flush (256 B threshold) for Android USB efficiency
  *   - Adaptive sleep based on FIFO fill level
  *   - flags bit1: ring-buffer drop indicator for receiver
+ *   - Overrun detected via INT_SOURCE (not FIFO_STATUS bit 7, which is
+ *     FIFO_TRIG and only meaningful in TRIGGER mode)
+ *   - frame_header_t.dropped: exact count of samples dropped since the
+ *     previous frame that reached the ring buffer
+ *   - Core 1 pauses acquisition while no USB host is attached, instead of
+ *     polling/dropping frames into the void
  */
 
 #include <string.h>
@@ -26,10 +32,16 @@
 // -------------------------------------------------------- ADXL345 registers --
 #define REG_BW_RATE     0x2C
 #define REG_POWER_CTL   0x2D
+#define REG_INT_SOURCE  0x30
 #define REG_DATA_FORMAT 0x31
 #define REG_DATAX0      0x32
 #define REG_FIFO_CTL    0x38
 #define REG_FIFO_STATUS 0x39
+
+// INT_SOURCE bit 0 latches on true FIFO overrun regardless of INT_ENABLE;
+// FIFO_STATUS bit 7 is FIFO_TRIG (trigger-mode only), not overrun, and
+// must not be used to detect overrun in STREAM mode.
+#define INT_SOURCE_OVERRUN 0x01u
 
 // -------------------------------------------------------- Stream parameters --
 #define ODR_3200HZ        0x0F
@@ -45,6 +57,7 @@ typedef struct {
     uint16_t seq_start;  // TX sequence start (LE)
     uint8_t  count;      // number of samples in frame
     uint8_t  flags;      // bit0: FIFO overrun  bit1: ring-buf drop
+    uint16_t dropped;    // samples dropped since previous frame (saturates at 0xFFFF)
 } frame_header_t;
 
 typedef struct {
@@ -66,6 +79,11 @@ typedef struct {
 static uint8_t           g_ring[RING_SIZE];
 static volatile uint32_t g_head = 0;  // producer index (Core 1)
 static volatile uint32_t g_tail = 0;  // consumer index (Core 0)
+
+// Written by Core 0 (usb_service), read by Core 1 (core1_sensor_loop).
+// A plain bool status flag; no ordering/atomicity guarantees needed beyond
+// what a single-word read/write already provides on Cortex-M0+.
+static volatile bool g_usb_connected = false;
 
 static inline uint32_t ring_used(void) { return g_head - g_tail; }
 static inline uint32_t ring_free(void) { return RING_SIZE - ring_used(); }
@@ -162,7 +180,8 @@ static void usb_service(void)
 {
     tud_task();     // TinyUSB event processing (mandatory, Core 0 only)
 
-    if (!tud_cdc_connected()) return;
+    g_usb_connected = tud_cdc_connected();
+    if (!g_usb_connected) return;
 
     const uint8_t *ptr;
     uint32_t chunk = ring_peek_contig(&ptr);
@@ -192,15 +211,29 @@ static void core1_sensor_loop(void)
     static uint8_t frame_buf[sizeof(frame_header_t)
                               + MAX_SAMPLES_FRAME * sizeof(sample_xyz_t) + 2];
 
-    uint16_t seq_tx     = 0;
-    uint32_t drop_count = 0;
+    uint16_t seq_tx         = 0;
+    uint32_t dropped_pending = 0;  // samples dropped since last reported frame
 
     while (true) {
+        // ---- Pause acquisition while no host is attached ----
+        // The ring buffer already holds any not-yet-drained backlog; there is
+        // no point polling/packing frames nobody will read. The ADXL345's own
+        // 32-entry FIFO keeps overwriting its oldest entry (STREAM mode) until
+        // we resume, which is the hardware's natural, bounded fallback.
+        if (!g_usb_connected) {
+            sleep_us(LOOP_SLEEP_US);
+            continue;
+        }
+
         // ---- Poll FIFO status ----
         uint8_t fifo_status = 0;
         read_registers(REG_FIFO_STATUS, &fifo_status, 1);
         uint8_t entries = fifo_status & 0x3Fu;
-        uint8_t overrun  = (uint8_t)(fifo_status >> 7u);
+
+        // ---- True overrun comes from INT_SOURCE, not FIFO_STATUS bit 7 ----
+        uint8_t int_source = 0;
+        read_registers(REG_INT_SOURCE, &int_source, 1);
+        uint8_t overrun = (int_source & INT_SOURCE_OVERRUN) ? 1u : 0u;
 
         if (!overrun && entries < FIFO_WATERMARK) {
             sleep_us(LOOP_SLEEP_US);
@@ -213,12 +246,17 @@ static void core1_sensor_loop(void)
             read_one_xyz6(&raw[6 * i]);
 
         // ---- Build frame ----
+        // Report drops accumulated from prior iterations; reset only once
+        // this report actually makes it into the ring buffer (see below).
+        uint16_t dropped_report = (uint16_t)(dropped_pending > 0xFFFFu
+                                                  ? 0xFFFFu : dropped_pending);
         frame_header_t hdr = {
             .sync1     = 0xFA,
             .sync2     = 0xCE,
             .seq_start = seq_tx,
             .count     = n,
-            .flags     = (uint8_t)(overrun | (drop_count ? 0x02u : 0x00u)),
+            .flags     = (uint8_t)(overrun | (dropped_report ? 0x02u : 0x00u)),
+            .dropped   = dropped_report,
         };
 
         size_t off = 0;
@@ -240,9 +278,9 @@ static void core1_sensor_loop(void)
 
         // ---- Push to ring buffer (non-blocking, never stalls) ----
         if (!ring_push(frame_buf, (uint32_t)off))
-            drop_count++;   // ring full: USB host too slow
+            dropped_pending += n;   // ring full: USB host too slow
         else
-            drop_count = 0;
+            dropped_pending = 0;    // report delivered, start a fresh count
 
         seq_tx += n;
 
