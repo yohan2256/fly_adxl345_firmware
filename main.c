@@ -14,6 +14,9 @@
  *     previous frame that reached the ring buffer
  *   - Core 1 pauses acquisition while no USB host is attached, instead of
  *     polling/dropping frames into the void
+ *   - flags bit2: periodic DEVID re-read failed (proxy for SPI link
+ *     integrity, since the ADXL345 has no CRC on its SPI output) — firmware
+ *     auto-reconfigures the sensor when this happens
  */
 
 #include <string.h>
@@ -30,6 +33,7 @@
 #define SPI_PORT spi1
 
 // -------------------------------------------------------- ADXL345 registers --
+#define REG_DEVID       0x00
 #define REG_BW_RATE     0x2C
 #define REG_POWER_CTL   0x2D
 #define REG_INT_SOURCE  0x30
@@ -42,6 +46,13 @@
 // FIFO_STATUS bit 7 is FIFO_TRIG (trigger-mode only), not overrun, and
 // must not be used to detect overrun in STREAM mode.
 #define INT_SOURCE_OVERRUN 0x01u
+
+// The ADXL345 has no CRC/parity on its SPI output, so per-sample integrity
+// cannot be verified directly. DEVID is a fixed, known value; re-reading it
+// periodically is the practical proxy for "is the SPI link still sane" and
+// catches wiring/timing faults that would otherwise silently corrupt samples.
+#define DEVID_EXPECTED       0xE5u
+#define LINK_CHECK_INTERVAL  100u   // re-verify DEVID every N transmitted frames
 
 // -------------------------------------------------------- Stream parameters --
 #define ODR_3200HZ        0x0F
@@ -56,7 +67,7 @@ typedef struct {
     uint8_t  sync2;      // 0xCE
     uint16_t seq_start;  // TX sequence start (LE)
     uint8_t  count;      // number of samples in frame
-    uint8_t  flags;      // bit0: FIFO overrun  bit1: ring-buf drop
+    uint8_t  flags;      // bit0: FIFO overrun  bit1: ring-buf drop  bit2: SPI link check failed
     uint16_t dropped;    // samples dropped since previous frame (saturates at 0xFFFF)
 } frame_header_t;
 
@@ -149,6 +160,24 @@ static inline void read_one_xyz6(uint8_t out6[6]) {
     read_registers(REG_DATAX0, out6, 6); // pops one FIFO sample
 }
 
+/** (Re-)apply the ADXL345 operating configuration. Used at startup and to
+ *  recover after a periodic DEVID check finds the link out of sync. */
+static inline void adxl345_configure(void) {
+    write_register(REG_DATA_FORMAT, 0x0Bu);                            // FULL_RES +/-16g
+    write_register(REG_BW_RATE,     ODR_3200HZ);                       // 3200 Hz
+    write_register(REG_FIFO_CTL,    0x80u | (FIFO_WATERMARK & 0x1Fu)); // STREAM + watermark
+    write_register(REG_POWER_CTL,   0x08u);                            // Measurement mode
+}
+
+/** Read DEVID and compare to the fixed expected value. The ADXL345 has no
+ *  CRC on its SPI output, so this is the practical substitute: DEVID never
+ *  changes, so any mismatch means the SPI link (or chip) is not behaving. */
+static inline bool adxl345_link_ok(void) {
+    uint8_t devid = 0;
+    read_registers(REG_DEVID, &devid, 1);
+    return devid == DEVID_EXPECTED;
+}
+
 // ===========================================================================
 // CRC16-CCITT
 // ===========================================================================
@@ -211,8 +240,9 @@ static void core1_sensor_loop(void)
     static uint8_t frame_buf[sizeof(frame_header_t)
                               + MAX_SAMPLES_FRAME * sizeof(sample_xyz_t) + 2];
 
-    uint16_t seq_tx         = 0;
+    uint16_t seq_tx          = 0;
     uint32_t dropped_pending = 0;  // samples dropped since last reported frame
+    uint32_t frames_since_check = 0;
 
     while (true) {
         // ---- Pause acquisition while no host is attached ----
@@ -245,6 +275,19 @@ static void core1_sensor_loop(void)
         for (uint8_t i = 0; i < n; i++)
             read_one_xyz6(&raw[6 * i]);
 
+        // ---- Periodic SPI link check (DEVID re-read) ----
+        // No per-sample CRC exists on this chip, so instead we periodically
+        // confirm the link is still returning the fixed DEVID value. On
+        // mismatch, flag it for the host and re-apply the configuration.
+        bool link_fault = false;
+        if (++frames_since_check >= LINK_CHECK_INTERVAL) {
+            frames_since_check = 0;
+            if (!adxl345_link_ok()) {
+                link_fault = true;
+                adxl345_configure();
+            }
+        }
+
         // ---- Build frame ----
         // Report drops accumulated from prior iterations; reset only once
         // this report actually makes it into the ring buffer (see below).
@@ -255,7 +298,8 @@ static void core1_sensor_loop(void)
             .sync2     = 0xCE,
             .seq_start = seq_tx,
             .count     = n,
-            .flags     = (uint8_t)(overrun | (dropped_report ? 0x02u : 0x00u)),
+            .flags     = (uint8_t)(overrun | (dropped_report ? 0x02u : 0x00u)
+                                            | (link_fault ? 0x04u : 0x00u)),
             .dropped   = dropped_report,
         };
 
@@ -321,11 +365,14 @@ int main(void)
         sleep_ms(1);
     }
 
-    // ADXL345 config
-    write_register(REG_DATA_FORMAT, 0x0Bu);                             // FULL_RES +/-16g
-    write_register(REG_BW_RATE,     ODR_3200HZ);                        // 3200 Hz
-    write_register(REG_FIFO_CTL,    0x80u | (FIFO_WATERMARK & 0x1Fu)); // STREAM + watermark
-    write_register(REG_POWER_CTL,   0x08u);                             // Measurement mode
+    // ADXL345 config, with a DEVID read-back to catch a dead/miswired SPI
+    // link before we ever start streaming (retry a few times, then proceed
+    // anyway — there is no display to halt on, and periodic checks in the
+    // sensor loop will keep flagging it to the host).
+    for (int attempt = 0; attempt < 3; attempt++) {
+        adxl345_configure();
+        if (adxl345_link_ok()) break;
+    }
 
     // Launch Core 1 (sensor read; SPI exclusive to Core 1 from here)
     multicore_launch_core1(core1_sensor_loop);
