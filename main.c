@@ -17,6 +17,16 @@
  *   - flags bit2: periodic DEVID re-read failed (proxy for SPI link
  *     integrity, since the ADXL345 has no CRC on its SPI output) — firmware
  *     auto-reconfigures the sensor when this happens
+ *   - Retransmission on request: the last ~16 KB of transmitted frames are
+ *     kept in a history buffer. If the host detects a bad/missing frame
+ *     (CRC mismatch or a gap in seq_start), it can ask for it again by
+ *     sending 4 bytes over the same CDC connection:
+ *       0xF0 0x0D <seq_lo> <seq_hi>   (seq = the frame's seq_start, LE)
+ *     The matching frame (if not yet evicted from history) is resent
+ *     verbatim, ahead of any live data, so the host sees it as soon as
+ *     possible. A request for an already-evicted or unknown seq is
+ *     silently ignored — the host must decide how long to wait before
+ *     giving up.
  */
 
 #include <string.h>
@@ -76,6 +86,9 @@ typedef struct {
 } sample_xyz_t;
 #pragma pack(pop)
 
+#define FRAME_BUF_MAX_LEN (sizeof(frame_header_t) \
+                            + MAX_SAMPLES_FRAME * sizeof(sample_xyz_t) + 2u)
+
 // ===========================================================================
 // SPSC ring buffer (Single-Producer/Single-Consumer, lock-free)
 //
@@ -127,6 +140,57 @@ static inline void ring_consume(uint32_t n)
 {
     __sync_synchronize();   // data read before tail advances
     g_tail += n;
+}
+
+// ===========================================================================
+// Retransmission history (Core 1 writes, Core 0 reads on request)
+//
+// Every frame that makes it into the live ring is also copied here. If the
+// host later reports a bad/missing frame, it can ask for that exact
+// seq_start again; we replay it from this buffer instead of the sensor,
+// since the original FIFO entry is long gone by then (each SPI read pops
+// it). Entries age out once HIST_SIZE bytes' worth of newer frames have
+// been written, or once HIST_MAX_ENTRIES newer frames exist.
+//
+// This is deliberately best-effort: Core 0 reads g_hist_data/g_hist_meta
+// without a lock while Core 1 keeps appending. A request landing exactly
+// as its slot is being recycled can yield a garbled resend, but the
+// resent frame carries the same CRC16 as any other frame, so the host
+// detects and can simply ask again.
+// ===========================================================================
+#define HIST_SIZE        16384u   // circular byte storage for frame history
+#define HIST_MASK        (HIST_SIZE - 1u)
+#define HIST_MAX_ENTRIES 256u     // frame metadata slots, must be power of 2
+#define HIST_ENTRY_MASK  (HIST_MAX_ENTRIES - 1u)
+
+typedef struct {
+    uint16_t seq_start;
+    uint16_t length;
+    uint32_t offset;
+    bool     valid;
+} hist_entry_t;
+
+static uint8_t           g_hist_data[HIST_SIZE];
+static hist_entry_t      g_hist_meta[HIST_MAX_ENTRIES];
+static volatile uint32_t g_hist_write_off = 0;  // Core 1-owned byte cursor
+static volatile uint32_t g_hist_meta_idx  = 0;  // Core 1-owned, monotonic count
+
+/** Core 1 only: append a just-queued frame to the resend history. */
+static void hist_append(const uint8_t *frame, uint32_t len, uint16_t seq_start)
+{
+    uint32_t off = g_hist_write_off;
+    for (uint32_t i = 0; i < len; i++)
+        g_hist_data[(off + i) & HIST_MASK] = frame[i];
+    __sync_synchronize();
+    g_hist_write_off = off + len;
+
+    hist_entry_t *e = &g_hist_meta[g_hist_meta_idx & HIST_ENTRY_MASK];
+    e->seq_start = seq_start;
+    e->length    = (uint16_t)len;
+    e->offset    = off;
+    __sync_synchronize();
+    e->valid = true;
+    g_hist_meta_idx++;
 }
 
 // ===========================================================================
@@ -202,15 +266,107 @@ static uint16_t crc16_ccitt(const uint8_t *data, size_t len)
 //
 // Batch-flush strategy: accumulate USB_FLUSH_BYTES before flushing.
 // Fewer USB transactions => better throughput on Android (1 ms polling).
+//
+// Resend protocol: host sends 0xF0 0x0D <seq_lo> <seq_hi> to ask for the
+// frame whose header seq_start equals that value. If it's still in
+// g_hist_data/g_hist_meta, it's staged into g_resend_buf and drained ahead
+// of the live ring on subsequent calls, so the host gets it as soon as
+// possible instead of waiting behind whatever is currently streaming.
 // ===========================================================================
 #define USB_FLUSH_BYTES 256u
+
+#define RESEND_CMD_SYNC1 0xF0u
+#define RESEND_CMD_SYNC2 0x0Du
+
+static uint8_t  g_resend_buf[FRAME_BUF_MAX_LEN];
+static uint32_t g_resend_len    = 0;
+static uint32_t g_resend_off    = 0;
+static bool     g_resend_active = false;
+
+/** Core 0 only: look up seq_start in the history and stage it for resend.
+ *  Silently does nothing if the frame was never seen or already evicted —
+ *  it is the host's job to decide when to give up waiting for a reply. */
+static void usb_stage_resend(uint16_t seq)
+{
+    uint32_t write_off = g_hist_write_off;
+    uint32_t count      = g_hist_meta_idx;
+    uint32_t n = (count < HIST_MAX_ENTRIES) ? count : HIST_MAX_ENTRIES;
+
+    for (uint32_t i = 0; i < n; i++) {
+        hist_entry_t *e = &g_hist_meta[(count - 1u - i) & HIST_ENTRY_MASK];
+        if (!e->valid || e->seq_start != seq) continue;
+        if (write_off - e->offset > HIST_SIZE) continue;   // already evicted
+        uint32_t len = e->length;
+        if (len == 0 || len > sizeof(g_resend_buf)) continue;
+
+        for (uint32_t b = 0; b < len; b++)
+            g_resend_buf[b] = g_hist_data[(e->offset + b) & HIST_MASK];
+        g_resend_len    = len;
+        g_resend_off    = 0;
+        g_resend_active = true;
+        return;
+    }
+}
+
+/** Core 0 only: parse incoming resend requests from the host. */
+static void usb_poll_resend_request(void)
+{
+    static uint8_t state = 0;   // 0/1 = waiting on sync bytes, 2/3 = seq bytes
+    static uint8_t seq_lo = 0;
+
+    uint8_t byte;
+    while (tud_cdc_available() && tud_cdc_read(&byte, 1) == 1) {
+        switch (state) {
+        case 0:
+            state = (byte == RESEND_CMD_SYNC1) ? 1u : 0u;
+            break;
+        case 1:
+            state = (byte == RESEND_CMD_SYNC2) ? 2u
+                   : (byte == RESEND_CMD_SYNC1) ? 1u : 0u;
+            break;
+        case 2:
+            seq_lo = byte;
+            state  = 3u;
+            break;
+        case 3:
+            usb_stage_resend((uint16_t)(seq_lo | ((uint16_t)byte << 8)));
+            state = 0u;
+            break;
+        }
+    }
+}
+
+/** Core 0 only: drain a staged resend frame, prioritized over live data. */
+static void usb_drain_resend(void)
+{
+    uint32_t remain = g_resend_len - g_resend_off;
+    uint32_t avail  = tud_cdc_write_available();
+    uint32_t chunk  = (remain < avail) ? remain : avail;
+    if (chunk) {
+        g_resend_off += tud_cdc_write(&g_resend_buf[g_resend_off], chunk);
+    }
+
+    if (g_resend_off >= g_resend_len) {
+        g_resend_active = false;
+        tud_cdc_write_flush();
+    } else if (tud_cdc_write_available() < USB_FLUSH_BYTES) {
+        tud_cdc_write_flush();
+    }
+}
 
 static void usb_service(void)
 {
     tud_task();     // TinyUSB event processing (mandatory, Core 0 only)
 
     g_usb_connected = tud_cdc_connected();
-    if (!g_usb_connected) return;
+    if (!g_usb_connected) { g_resend_active = false; return; }
+
+    usb_poll_resend_request();
+
+    if (g_resend_active) {
+        usb_drain_resend();
+        return;     // resend takes priority; live ring resumes next call
+    }
 
     const uint8_t *ptr;
     uint32_t chunk = ring_peek_contig(&ptr);
@@ -237,8 +393,7 @@ static void usb_service(void)
 static void core1_sensor_loop(void)
 {
     static uint8_t raw[6 * MAX_SAMPLES_FRAME];
-    static uint8_t frame_buf[sizeof(frame_header_t)
-                              + MAX_SAMPLES_FRAME * sizeof(sample_xyz_t) + 2];
+    static uint8_t frame_buf[FRAME_BUF_MAX_LEN];
 
     uint16_t seq_tx          = 0;
     uint32_t dropped_pending = 0;  // samples dropped since last reported frame
@@ -321,10 +476,12 @@ static void core1_sensor_loop(void)
         frame_buf[off++] = (uint8_t)(crc >> 8u);
 
         // ---- Push to ring buffer (non-blocking, never stalls) ----
-        if (!ring_push(frame_buf, (uint32_t)off))
+        if (!ring_push(frame_buf, (uint32_t)off)) {
             dropped_pending += n;   // ring full: USB host too slow
-        else
+        } else {
             dropped_pending = 0;    // report delivered, start a fresh count
+            hist_append(frame_buf, (uint32_t)off, hdr.seq_start);
+        }
 
         seq_tx += n;
 
