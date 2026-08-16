@@ -39,12 +39,21 @@
  *     calibration the host can use in place of the nominal constant.
  *   - Remote bootloader entry: the host can ask this firmware to reboot
  *     straight into the RP2040's ROM USB bootloader (no BOOTSEL button
- *     needed) by sending 2 bytes over the same CDC connection:
- *       0xF0 0xB0
- *     On receipt, reset_usb_boot(0, 0) is called immediately — the device
- *     disconnects and re-enumerates as the standard RP2040 bootrom USB
- *     device (VID 0x2E8A, PID 0x0003), exposing the PICOBOOT interface a
- *     host can flash a new .uf2/.bin image through. See PROTOCOL.md 9절.
+ *     needed) by sending an 8-byte magic sequence over the same CDC
+ *     connection (see REBOOT_MAGIC below). On receipt, reset_usb_boot(0, 0)
+ *     is called immediately — the device disconnects and re-enumerates as
+ *     the standard RP2040 bootrom USB device (VID 0x2E8A, PID 0x0003),
+ *     exposing the PICOBOOT interface a host can flash a new .uf2/.bin
+ *     image through. See PROTOCOL.md 9절.
+ *     The sequence was widened from an original 2-byte 0xF0 0xB0 design:
+ *     with only 2 bytes, ordinary binary noise on the line (a stray
+ *     terminal, a host-side bug, line garbage on connect) had a realistic
+ *     chance of matching by accident and dropping the device into the
+ *     bootloader unprompted, which looks to the user like "USB stopped
+ *     being recognized" since the CDC device vanishes and a PICOBOOT
+ *     device the host software doesn't expect takes its place. 8 bytes
+ *     makes accidental collision negligible while keeping the same
+ *     no-handshake, no-ACK design (see PROTOCOL.md 9절).
  */
 
 #include <string.h>
@@ -303,19 +312,25 @@ static uint16_t crc16_ccitt(const uint8_t *data, size_t len)
 // of the live ring on subsequent calls, so the host gets it as soon as
 // possible instead of waiting behind whatever is currently streaming.
 //
-// Reboot-to-bootloader: host sends 0xF0 0xB0 to jump straight into the ROM
-// USB bootloader (see REBOOT_CMD_SYNC1/2 below and PROTOCOL.md 9절).
+// Reboot-to-bootloader: host sends the REBOOT_MAGIC byte sequence to jump
+// straight into the ROM USB bootloader (see below and PROTOCOL.md 9절).
 // ===========================================================================
 #define USB_FLUSH_BYTES 256u
 
 #define RESEND_CMD_SYNC1 0xF0u
 #define RESEND_CMD_SYNC2 0x0Du
 
-// 부트로더 진입 명령: 0xF0 0xB0 (payload 없음, 재전송 요청과 sync1을 공유하고
-// sync2로 구분). 수신 즉시 reset_usb_boot()를 호출 — 응답이나 ACK 없이
-// 장치가 바로 USB 재열거된다 (PROTOCOL.md 9절).
-#define REBOOT_CMD_SYNC1 0xF0u
-#define REBOOT_CMD_SYNC2 0xB0u
+// 부트로더 진입 명령: 8바이트 매직 시퀀스 (payload 없음). 수신 즉시
+// reset_usb_boot()를 호출 — 응답이나 ACK 없이 장치가 바로 USB 재열거된다
+// (PROTOCOL.md 9절). 이전에는 2바이트(0xF0 0xB0)였으나, 회선 잡음이나 다른
+// 호스트 소프트웨어가 우연히 그 2바이트를 보낼 확률이 무시할 수 없어
+// 의도치 않은 부트로더 진입("USB 인식 안 됨"으로 보이는 증상)을 유발할 수
+// 있었다. 8바이트로 늘려 우연한 매칭 확률을 사실상 0으로 만든다. 재전송
+// 요청(0xF0 0x0D <seq_lo> <seq_hi>, 4바이트)과는 독립적으로 매 바이트마다
+// 별도 시프트 레지스터로 검사되므로 서로 간섭하지 않는다.
+static const uint8_t REBOOT_MAGIC[8] = {
+    0xF0u, 0xB0u, 'R', 'E', 'B', 'O', 'O', 'T'
+};
 
 static uint8_t  g_resend_buf[FRAME_BUF_MAX_LEN];
 static uint32_t g_resend_len    = 0;
@@ -347,38 +362,64 @@ static void usb_stage_resend(uint16_t seq)
     }
 }
 
-/** Core 0 only: parse incoming host commands (resend request / reboot to
- *  bootloader). Both share sync1=0xF0 and are distinguished by sync2. */
-static void usb_poll_host_commands(void)
+/** Core 0 only: parse incoming resend requests from the host
+ *  (0xF0 0x0D <seq_lo> <seq_hi>). */
+static void usb_poll_resend_request(uint8_t byte)
 {
-    static uint8_t state = 0;   // 0/1 = waiting on sync bytes, 2/3 = resend seq bytes
+    static uint8_t state = 0;   // 0/1 = waiting on sync bytes, 2/3 = seq bytes
     static uint8_t seq_lo = 0;
 
+    switch (state) {
+    case 0:
+        state = (byte == RESEND_CMD_SYNC1) ? 1u : 0u;
+        break;
+    case 1:
+        state = (byte == RESEND_CMD_SYNC2) ? 2u
+               : (byte == RESEND_CMD_SYNC1) ? 1u : 0u;
+        break;
+    case 2:
+        seq_lo = byte;
+        state  = 3u;
+        break;
+    case 3:
+        usb_stage_resend((uint16_t)(seq_lo | ((uint16_t)byte << 8)));
+        state = 0u;
+        break;
+    }
+}
+
+/** Core 0 only: watch every incoming byte for REBOOT_MAGIC via an 8-byte
+ *  shift register. Independent of usb_poll_resend_request() — sliding
+ *  window means a false match requires 8 consecutive bytes to line up
+ *  exactly, regardless of how the resend parser is framing the same
+ *  stream at the time. */
+static void usb_poll_reboot_magic(uint8_t byte)
+{
+    static uint64_t shift = 0;
+    static uint64_t magic = 0;
+    static bool     magic_built = false;
+
+    if (!magic_built) {
+        for (int i = 0; i < 8; i++)
+            magic = (magic << 8) | REBOOT_MAGIC[i];
+        magic_built = true;
+    }
+
+    shift = (shift << 8) | byte;
+    if (shift == magic) {
+        // 반환하지 않음 — 재부팅 즉시 ROM 부트로더로 점프
+        reset_usb_boot(0, 0);
+    }
+}
+
+/** Core 0 only: parse incoming host commands (resend request / reboot to
+ *  bootloader). Every byte is fed to both parsers independently. */
+static void usb_poll_host_commands(void)
+{
     uint8_t byte;
     while (tud_cdc_available() && tud_cdc_read(&byte, 1) == 1) {
-        switch (state) {
-        case 0:
-            state = (byte == RESEND_CMD_SYNC1) ? 1u : 0u;
-            break;
-        case 1:
-            if (byte == RESEND_CMD_SYNC2) {
-                state = 2u;
-            } else if (byte == REBOOT_CMD_SYNC2) {
-                // 반환하지 않음 — 재부팅 즉시 ROM 부트로더로 점프
-                reset_usb_boot(0, 0);
-            } else {
-                state = (byte == RESEND_CMD_SYNC1) ? 1u : 0u;
-            }
-            break;
-        case 2:
-            seq_lo = byte;
-            state  = 3u;
-            break;
-        case 3:
-            usb_stage_resend((uint16_t)(seq_lo | ((uint16_t)byte << 8)));
-            state = 0u;
-            break;
-        }
+        usb_poll_resend_request(byte);
+        usb_poll_reboot_magic(byte);
     }
 }
 
