@@ -27,6 +27,16 @@
  *     possible. A request for an already-evicted or unknown seq is
  *     silently ignored — the host must decide how long to wait before
  *     giving up.
+ *   - Status frames (0xFA 0xCD): the ADXL345's ODR is derived from an
+ *     internal RC oscillator, factory-trimmed to only +/-2% (up to +/-5%
+ *     over temperature per ADI). FS_DEFAULT = 3200.0 Hz on the host side is
+ *     therefore a nominal value, not the true sample rate, and since
+ *     stiffness-type results scale with fs^2 in downstream analysis, that
+ *     clock error is amplified. The RP2040's crystal reference (~+/-30 ppm)
+ *     is two orders of magnitude more accurate, so Core 1 times its own
+ *     FIFO reads against it once a second and reports the true measured
+ *     ODR to the host — a free, per-device, temperature-tracking
+ *     calibration the host can use in place of the nominal constant.
  */
 
 #include <string.h>
@@ -84,10 +94,21 @@ typedef struct {
 typedef struct {
     int16_t x, y, z;
 } sample_xyz_t;
+
+// Periodic status frame: reports the ODR actually measured against the
+// RP2040's crystal, in milli-Hz (Hz * 1000), so the host isn't stuck
+// assuming the nominal 3200 Hz.
+typedef struct {
+    uint8_t  sync1;    // 0xFA
+    uint8_t  sync2;    // 0xCD
+    uint32_t odr_mhz;  // measured ODR, milli-Hz, LE
+} status_header_t;
 #pragma pack(pop)
 
 #define FRAME_BUF_MAX_LEN (sizeof(frame_header_t) \
                             + MAX_SAMPLES_FRAME * sizeof(sample_xyz_t) + 2u)
+#define STATUS_FRAME_LEN  (sizeof(status_header_t) + 2u)   // header + CRC16
+#define ODR_REPORT_INTERVAL_US 1000000ull   // report measured ODR ~once/second
 
 // ===========================================================================
 // SPSC ring buffer (Single-Producer/Single-Consumer, lock-free)
@@ -384,6 +405,23 @@ static void usb_service(void)
         tud_cdc_write_flush();
 }
 
+/** Core 1 only: build and push a status frame reporting the ODR measured
+ *  over the last ~1 s window against the RP2040's crystal-timed clock. */
+static void push_status_frame(uint32_t odr_mhz)
+{
+    uint8_t buf[STATUS_FRAME_LEN];
+    status_header_t hdr = {
+        .sync1   = 0xFA,
+        .sync2   = 0xCD,
+        .odr_mhz = odr_mhz,
+    };
+    memcpy(buf, &hdr, sizeof(hdr));
+    uint16_t crc = crc16_ccitt(buf, sizeof(hdr));
+    buf[sizeof(hdr)]     = (uint8_t)(crc & 0xFFu);
+    buf[sizeof(hdr) + 1] = (uint8_t)(crc >> 8u);
+    ring_push(buf, sizeof(buf));   // best-effort: a fresh one follows in ~1 s
+}
+
 // ===========================================================================
 // Core 1: ADXL345 sensor loop
 //
@@ -399,6 +437,13 @@ static void core1_sensor_loop(void)
     uint32_t dropped_pending = 0;  // samples dropped since last reported frame
     uint32_t frames_since_check = 0;
 
+    // ODR measurement window: counts samples actually popped from the FIFO
+    // against time_us_64() (RP2040 crystal-timed), independent of USB/host
+    // jitter. Reset whenever acquisition is paused so a resume doesn't
+    // count idle time as part of the window.
+    uint64_t odr_window_start_us = time_us_64();
+    uint32_t odr_sample_count    = 0;
+
     while (true) {
         // ---- Pause acquisition while no host is attached ----
         // The ring buffer already holds any not-yet-drained backlog; there is
@@ -406,6 +451,8 @@ static void core1_sensor_loop(void)
         // 32-entry FIFO keeps overwriting its oldest entry (STREAM mode) until
         // we resume, which is the hardware's natural, bounded fallback.
         if (!g_usb_connected) {
+            odr_window_start_us = time_us_64();
+            odr_sample_count    = 0;
             sleep_us(LOOP_SLEEP_US);
             continue;
         }
@@ -429,6 +476,7 @@ static void core1_sensor_loop(void)
         uint8_t n = (entries > MAX_SAMPLES_FRAME) ? MAX_SAMPLES_FRAME : entries;
         for (uint8_t i = 0; i < n; i++)
             read_one_xyz6(&raw[6 * i]);
+        odr_sample_count += n;
 
         // ---- Periodic SPI link check (DEVID re-read) ----
         // No per-sample CRC exists on this chip, so instead we periodically
@@ -484,6 +532,17 @@ static void core1_sensor_loop(void)
         }
 
         seq_tx += n;
+
+        // ---- Report measured ODR once the window closes ----
+        uint64_t now_us = time_us_64();
+        uint64_t elapsed_us = now_us - odr_window_start_us;
+        if (elapsed_us >= ODR_REPORT_INTERVAL_US && odr_sample_count > 0) {
+            uint32_t odr_mhz = (uint32_t)((uint64_t)odr_sample_count
+                                           * 1000000000ull / elapsed_us);
+            push_status_frame(odr_mhz);
+            odr_window_start_us = now_us;
+            odr_sample_count    = 0;
+        }
 
         // ---- Adaptive sleep ----
         // Overrun or FIFO nearly full: no sleep, drain immediately
