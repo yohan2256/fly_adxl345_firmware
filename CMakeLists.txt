@@ -21,6 +21,7 @@ target_include_directories(fly_adxl345_firmware PRIVATE
 target_link_libraries(fly_adxl345_firmware
     pico_stdlib
     pico_multicore
+    pico_bootrom
     hardware_spi
     tinyusb_device
     tinyusb_board
