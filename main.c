@@ -1,19 +1,21 @@
 /**
  * Fly-ADXL345-USB High Speed Firmware
- * FIX: ADXL345 FIFO read — 6-byte burst per sample (each pops one entry)
- * IMPROVED:
+ *
+ * USB layer: SDK stock stdio_usb (stdio_init_all), the same path the
+ * original working firmware used. The custom TinyUSB descriptor set this
+ * project previously carried failed to enumerate on this board — the host
+ * saw no device at all, not even a failed one — while this stock path is
+ * confirmed working on the same board, same SDK, same toolchain. Binary
+ * framing is preserved by disabling CRLF translation, exactly as the
+ * original firmware did.
+ *
+ * Everything else this project gained since then is kept:
  *   - Dual-core: Core 0 = USB service, Core 1 = sensor read
  *   - 8 KB SPSC ring buffer (lock-free) decouples sensor from USB
- *   - Direct TinyUSB (no stdio_usb) → non-blocking writes
- *   - Batch flush (256 B threshold) for Android USB efficiency
- *   - Adaptive sleep based on FIFO fill level
- *   - flags bit1: ring-buffer drop indicator for receiver
- *   - Overrun detected via INT_SOURCE (not FIFO_STATUS bit 7, which is
- *     FIFO_TRIG and only meaningful in TRIGGER mode)
- *   - frame_header_t.dropped: exact count of samples dropped since the
- *     previous frame that reached the ring buffer
- *   - Core 1 pauses acquisition while no USB host is attached, instead of
- *     polling/dropping frames into the void
+ *   - flags bit0: FIFO overrun, detected via INT_SOURCE (not FIFO_STATUS
+ *     bit 7, which is FIFO_TRIG and only meaningful in TRIGGER mode)
+ *   - flags bit1 + frame_header_t.dropped: exact count of samples dropped
+ *     since the previous frame that reached the ring buffer
  *   - flags bit2: periodic DEVID re-read failed (proxy for SPI link
  *     integrity, since the ADXL345 has no CRC on its SPI output) — firmware
  *     auto-reconfigures the sensor when this happens
@@ -22,46 +24,29 @@
  *     (CRC mismatch or a gap in seq_start), it can ask for it again by
  *     sending 4 bytes over the same CDC connection:
  *       0xF0 0x0D <seq_lo> <seq_hi>   (seq = the frame's seq_start, LE)
- *     The matching frame (if not yet evicted from history) is resent
- *     verbatim, ahead of any live data, so the host sees it as soon as
- *     possible. A request for an already-evicted or unknown seq is
- *     silently ignored — the host must decide how long to wait before
- *     giving up.
- *   - Status frames (0xFA 0xCD): the ADXL345's ODR is derived from an
- *     internal RC oscillator, factory-trimmed to only +/-2% (up to +/-5%
- *     over temperature per ADI). FS_DEFAULT = 3200.0 Hz on the host side is
- *     therefore a nominal value, not the true sample rate, and since
- *     stiffness-type results scale with fs^2 in downstream analysis, that
- *     clock error is amplified. The RP2040's crystal reference (~+/-30 ppm)
- *     is two orders of magnitude more accurate, so Core 1 times its own
- *     FIFO reads against it once a second and reports the true measured
- *     ODR to the host — a free, per-device, temperature-tracking
- *     calibration the host can use in place of the nominal constant.
- *   - Remote bootloader entry: the host can ask this firmware to reboot
- *     straight into the RP2040's ROM USB bootloader (no BOOTSEL button
- *     needed) by sending an 8-byte magic sequence over the same CDC
- *     connection (see REBOOT_MAGIC below). On receipt, reset_usb_boot(0, 0)
- *     is called immediately — the device disconnects and re-enumerates as
- *     the standard RP2040 bootrom USB device (VID 0x2E8A, PID 0x0003),
- *     exposing the PICOBOOT interface a host can flash a new .uf2/.bin
- *     image through. See PROTOCOL.md 9절.
- *     The sequence was widened from an original 2-byte 0xF0 0xB0 design:
- *     with only 2 bytes, ordinary binary noise on the line (a stray
- *     terminal, a host-side bug, line garbage on connect) had a realistic
- *     chance of matching by accident and dropping the device into the
- *     bootloader unprompted, which looks to the user like "USB stopped
- *     being recognized" since the CDC device vanishes and a PICOBOOT
- *     device the host software doesn't expect takes its place. 8 bytes
- *     makes accidental collision negligible while keeping the same
- *     no-handshake, no-ACK design (see PROTOCOL.md 9절).
+ *   - Status frames (0xFA 0xCD): the ADXL345's ODR comes from an internal
+ *     RC oscillator trimmed to only +/-2% (up to +/-5% over temperature),
+ *     so a nominal 3200 Hz constant on the host is wrong by enough to
+ *     matter once results scale with fs^2. Core 1 times its own FIFO reads
+ *     against the RP2040 crystal (~+/-30 ppm) and reports the true measured
+ *     ODR about once a second.
+ *   - Remote bootloader entry: an 8-byte magic sequence (REBOOT_MAGIC)
+ *     calls reset_usb_boot(0, 0), re-enumerating as the RP2040 bootrom
+ *     PICOBOOT device so a host can flash a new image without BOOTSEL.
+ *
+ * Note vs. the previous revision: acquisition is no longer paused while the
+ * host is not asserting DTR. The original working firmware streamed
+ * unconditionally, and gating on stdio_usb_connected() risks a silent
+ * no-data condition with hosts that never raise DTR. Reliability first.
  */
 
+#include <stdio.h>
 #include <string.h>
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
 #include "pico/bootrom.h"
+#include "pico/stdio_usb.h"
 #include "hardware/spi.h"
-#include "tusb.h"
 
 // ------------------------------------------------------------------ Pins ---
 #define PIN_CS   9
@@ -87,8 +72,7 @@
 
 // The ADXL345 has no CRC/parity on its SPI output, so per-sample integrity
 // cannot be verified directly. DEVID is a fixed, known value; re-reading it
-// periodically is the practical proxy for "is the SPI link still sane" and
-// catches wiring/timing faults that would otherwise silently corrupt samples.
+// periodically is the practical proxy for "is the SPI link still sane".
 #define DEVID_EXPECTED       0xE5u
 #define LINK_CHECK_INTERVAL  100u   // re-verify DEVID every N transmitted frames
 
@@ -114,8 +98,7 @@ typedef struct {
 } sample_xyz_t;
 
 // Periodic status frame: reports the ODR actually measured against the
-// RP2040's crystal, in milli-Hz (Hz * 1000), so the host isn't stuck
-// assuming the nominal 3200 Hz.
+// RP2040's crystal, in milli-Hz (Hz * 1000).
 typedef struct {
     uint8_t  sync1;    // 0xFA
     uint8_t  sync2;    // 0xCD
@@ -142,11 +125,6 @@ typedef struct {
 static uint8_t           g_ring[RING_SIZE];
 static volatile uint32_t g_head = 0;  // producer index (Core 1)
 static volatile uint32_t g_tail = 0;  // consumer index (Core 0)
-
-// Written by Core 0 (usb_service), read by Core 1 (core1_sensor_loop).
-// A plain bool status flag; no ordering/atomicity guarantees needed beyond
-// what a single-word read/write already provides on Cortex-M0+.
-static volatile bool g_usb_connected = false;
 
 static inline uint32_t ring_used(void) { return g_head - g_tail; }
 static inline uint32_t ring_free(void) { return RING_SIZE - ring_used(); }
@@ -184,18 +162,10 @@ static inline void ring_consume(uint32_t n)
 // ===========================================================================
 // Retransmission history (Core 1 writes, Core 0 reads on request)
 //
-// Every frame that makes it into the live ring is also copied here. If the
-// host later reports a bad/missing frame, it can ask for that exact
-// seq_start again; we replay it from this buffer instead of the sensor,
-// since the original FIFO entry is long gone by then (each SPI read pops
-// it). Entries age out once HIST_SIZE bytes' worth of newer frames have
-// been written, or once HIST_MAX_ENTRIES newer frames exist.
-//
-// This is deliberately best-effort: Core 0 reads g_hist_data/g_hist_meta
-// without a lock while Core 1 keeps appending. A request landing exactly
-// as its slot is being recycled can yield a garbled resend, but the
-// resent frame carries the same CRC16 as any other frame, so the host
-// detects and can simply ask again.
+// Best-effort by design: Core 0 reads without a lock while Core 1 appends.
+// A request landing exactly as its slot is recycled can yield a garbled
+// resend, but the resent frame carries the same CRC16 as any other frame,
+// so the host detects it and can simply ask again.
 // ===========================================================================
 #define HIST_SIZE        16384u   // circular byte storage for frame history
 #define HIST_MASK        (HIST_SIZE - 1u)
@@ -263,8 +233,7 @@ static inline void read_one_xyz6(uint8_t out6[6]) {
     read_registers(REG_DATAX0, out6, 6); // pops one FIFO sample
 }
 
-/** (Re-)apply the ADXL345 operating configuration. Used at startup and to
- *  recover after a periodic DEVID check finds the link out of sync. */
+/** (Re-)apply the ADXL345 operating configuration. */
 static inline void adxl345_configure(void) {
     write_register(REG_DATA_FORMAT, 0x0Bu);                            // FULL_RES +/-16g
     write_register(REG_BW_RATE,     ODR_3200HZ);                       // 3200 Hz
@@ -272,9 +241,7 @@ static inline void adxl345_configure(void) {
     write_register(REG_POWER_CTL,   0x08u);                            // Measurement mode
 }
 
-/** Read DEVID and compare to the fixed expected value. The ADXL345 has no
- *  CRC on its SPI output, so this is the practical substitute: DEVID never
- *  changes, so any mismatch means the SPI link (or chip) is not behaving. */
+/** Read DEVID and compare to the fixed expected value. */
 static inline bool adxl345_link_ok(void) {
     uint8_t devid = 0;
     read_registers(REG_DEVID, &devid, 1);
@@ -297,53 +264,31 @@ static uint16_t crc16_ccitt(const uint8_t *data, size_t len)
 }
 
 // ===========================================================================
-// Core 0: USB service
+// Core 0: USB service (stock stdio_usb)
 //
-// tud_task() MUST run on Core 0 (USB IRQ bound to Core 0).
-// tud_cdc_write() puts data into TinyUSB's internal TX FIFO (non-blocking).
-// tud_cdc_write_flush() marks the FIFO as ready for the next USB transfer.
-//
-// Batch-flush strategy: accumulate USB_FLUSH_BYTES before flushing.
-// Fewer USB transactions => better throughput on Android (1 ms polling).
-//
-// Resend protocol: host sends 0xF0 0x0D <seq_lo> <seq_hi> to ask for the
-// frame whose header seq_start equals that value. If it's still in
-// g_hist_data/g_hist_meta, it's staged into g_resend_buf and drained ahead
-// of the live ring on subsequent calls, so the host gets it as soon as
-// possible instead of waiting behind whatever is currently streaming.
-//
-// Reboot-to-bootloader: host sends the REBOOT_MAGIC byte sequence to jump
-// straight into the ROM USB bootloader (see below and PROTOCOL.md 9절).
+// stdio_usb runs TinyUSB's own task on a background timer, so there is no
+// tud_task() to pump here — Core 0 only moves bytes between the ring buffer
+// and stdout, and parses host commands.
 // ===========================================================================
-#define USB_FLUSH_BYTES 256u
-
 #define RESEND_CMD_SYNC1 0xF0u
 #define RESEND_CMD_SYNC2 0x0Du
 
-// 부트로더 진입 명령: 8바이트 매직 시퀀스 (payload 없음). 수신 즉시
-// reset_usb_boot()를 호출 — 응답이나 ACK 없이 장치가 바로 USB 재열거된다
-// (PROTOCOL.md 9절). 이전에는 2바이트(0xF0 0xB0)였으나, 회선 잡음이나 다른
-// 호스트 소프트웨어가 우연히 그 2바이트를 보낼 확률이 무시할 수 없어
-// 의도치 않은 부트로더 진입("USB 인식 안 됨"으로 보이는 증상)을 유발할 수
-// 있었다. 8바이트로 늘려 우연한 매칭 확률을 사실상 0으로 만든다. 재전송
-// 요청(0xF0 0x0D <seq_lo> <seq_hi>, 4바이트)과는 독립적으로 매 바이트마다
-// 별도 시프트 레지스터로 검사되므로 서로 간섭하지 않는다.
+// 부트로더 진입 명령: 8바이트 매직 시퀀스. 2바이트(0xF0 0xB0)였을 때는
+// 회선 잡음이 우연히 일치해 의도치 않게 부트로더로 진입할 수 있었다.
 static const uint8_t REBOOT_MAGIC[8] = {
     0xF0u, 0xB0u, 'R', 'E', 'B', 'O', 'O', 'T'
 };
 
 static uint8_t  g_resend_buf[FRAME_BUF_MAX_LEN];
 static uint32_t g_resend_len    = 0;
-static uint32_t g_resend_off    = 0;
 static bool     g_resend_active = false;
 
 /** Core 0 only: look up seq_start in the history and stage it for resend.
- *  Silently does nothing if the frame was never seen or already evicted —
- *  it is the host's job to decide when to give up waiting for a reply. */
+ *  Silently does nothing if the frame was never seen or already evicted. */
 static void usb_stage_resend(uint16_t seq)
 {
     uint32_t write_off = g_hist_write_off;
-    uint32_t count      = g_hist_meta_idx;
+    uint32_t count     = g_hist_meta_idx;
     uint32_t n = (count < HIST_MAX_ENTRIES) ? count : HIST_MAX_ENTRIES;
 
     for (uint32_t i = 0; i < n; i++) {
@@ -356,17 +301,15 @@ static void usb_stage_resend(uint16_t seq)
         for (uint32_t b = 0; b < len; b++)
             g_resend_buf[b] = g_hist_data[(e->offset + b) & HIST_MASK];
         g_resend_len    = len;
-        g_resend_off    = 0;
         g_resend_active = true;
         return;
     }
 }
 
-/** Core 0 only: parse incoming resend requests from the host
- *  (0xF0 0x0D <seq_lo> <seq_hi>). */
+/** Core 0 only: parse incoming resend requests (0xF0 0x0D <lo> <hi>). */
 static void usb_poll_resend_request(uint8_t byte)
 {
-    static uint8_t state = 0;   // 0/1 = waiting on sync bytes, 2/3 = seq bytes
+    static uint8_t state  = 0;   // 0/1 = sync bytes, 2/3 = seq bytes
     static uint8_t seq_lo = 0;
 
     switch (state) {
@@ -388,15 +331,12 @@ static void usb_poll_resend_request(uint8_t byte)
     }
 }
 
-/** Core 0 only: watch every incoming byte for REBOOT_MAGIC via an 8-byte
- *  shift register. Independent of usb_poll_resend_request() — sliding
- *  window means a false match requires 8 consecutive bytes to line up
- *  exactly, regardless of how the resend parser is framing the same
- *  stream at the time. */
+/** Core 0 only: watch every incoming byte for REBOOT_MAGIC via a sliding
+ *  8-byte shift register, independent of the resend parser's framing. */
 static void usb_poll_reboot_magic(uint8_t byte)
 {
-    static uint64_t shift = 0;
-    static uint64_t magic = 0;
+    static uint64_t shift       = 0;
+    static uint64_t magic       = 0;
     static bool     magic_built = false;
 
     if (!magic_built) {
@@ -412,67 +352,42 @@ static void usb_poll_reboot_magic(uint8_t byte)
     }
 }
 
-/** Core 0 only: parse incoming host commands (resend request / reboot to
- *  bootloader). Every byte is fed to both parsers independently. */
+/** Core 0 only: drain whatever the host has sent, feeding both parsers. */
 static void usb_poll_host_commands(void)
 {
-    uint8_t byte;
-    while (tud_cdc_available() && tud_cdc_read(&byte, 1) == 1) {
+    int c;
+    while ((c = getchar_timeout_us(0)) != PICO_ERROR_TIMEOUT) {
+        uint8_t byte = (uint8_t)c;
         usb_poll_resend_request(byte);
         usb_poll_reboot_magic(byte);
     }
 }
 
-/** Core 0 only: drain a staged resend frame, prioritized over live data. */
-static void usb_drain_resend(void)
-{
-    uint32_t remain = g_resend_len - g_resend_off;
-    uint32_t avail  = tud_cdc_write_available();
-    uint32_t chunk  = (remain < avail) ? remain : avail;
-    if (chunk) {
-        g_resend_off += tud_cdc_write(&g_resend_buf[g_resend_off], chunk);
-    }
-
-    if (g_resend_off >= g_resend_len) {
-        g_resend_active = false;
-        tud_cdc_write_flush();
-    } else if (tud_cdc_write_available() < USB_FLUSH_BYTES) {
-        tud_cdc_write_flush();
-    }
-}
-
 static void usb_service(void)
 {
-    tud_task();     // TinyUSB event processing (mandatory, Core 0 only)
-
-    g_usb_connected = tud_cdc_connected();
-    if (!g_usb_connected) { g_resend_active = false; return; }
-
     usb_poll_host_commands();
 
+    // Resend takes priority so the host fills its gap as soon as possible.
     if (g_resend_active) {
-        usb_drain_resend();
-        return;     // resend takes priority; live ring resumes next call
+        fwrite(g_resend_buf, 1, g_resend_len, stdout);
+        fflush(stdout);
+        g_resend_active = false;
+        return;
     }
 
     const uint8_t *ptr;
     uint32_t chunk = ring_peek_contig(&ptr);
-    if (!chunk) return;
+    if (!chunk) {
+        sleep_us(LOOP_SLEEP_US);
+        return;
+    }
 
-    uint32_t avail = tud_cdc_write_available();
-    if (chunk > avail) chunk = avail;
-    if (!chunk) return;             // TinyUSB TX FIFO full — retry next call
-
-    uint32_t written = tud_cdc_write(ptr, chunk);
-    ring_consume(written);
-
-    // Flush when ring drained or TinyUSB TX FIFO is nearly full
-    if (ring_used() == 0 || tud_cdc_write_available() < USB_FLUSH_BYTES)
-        tud_cdc_write_flush();
+    fwrite(ptr, 1, chunk, stdout);
+    fflush(stdout);
+    ring_consume(chunk);
 }
 
-/** Core 1 only: build and push a status frame reporting the ODR measured
- *  over the last ~1 s window against the RP2040's crystal-timed clock. */
+/** Core 1 only: build and push a status frame reporting the measured ODR. */
 static void push_status_frame(uint32_t odr_mhz)
 {
     uint8_t buf[STATUS_FRAME_LEN];
@@ -499,30 +414,17 @@ static void core1_sensor_loop(void)
     static uint8_t raw[6 * MAX_SAMPLES_FRAME];
     static uint8_t frame_buf[FRAME_BUF_MAX_LEN];
 
-    uint16_t seq_tx          = 0;
-    uint32_t dropped_pending = 0;  // samples dropped since last reported frame
+    uint16_t seq_tx             = 0;
+    uint32_t dropped_pending    = 0;  // samples dropped since last reported frame
     uint32_t frames_since_check = 0;
 
     // ODR measurement window: counts samples actually popped from the FIFO
     // against time_us_64() (RP2040 crystal-timed), independent of USB/host
-    // jitter. Reset whenever acquisition is paused so a resume doesn't
-    // count idle time as part of the window.
+    // jitter.
     uint64_t odr_window_start_us = time_us_64();
     uint32_t odr_sample_count    = 0;
 
     while (true) {
-        // ---- Pause acquisition while no host is attached ----
-        // The ring buffer already holds any not-yet-drained backlog; there is
-        // no point polling/packing frames nobody will read. The ADXL345's own
-        // 32-entry FIFO keeps overwriting its oldest entry (STREAM mode) until
-        // we resume, which is the hardware's natural, bounded fallback.
-        if (!g_usb_connected) {
-            odr_window_start_us = time_us_64();
-            odr_sample_count    = 0;
-            sleep_us(LOOP_SLEEP_US);
-            continue;
-        }
-
         // ---- Poll FIFO status ----
         uint8_t fifo_status = 0;
         read_registers(REG_FIFO_STATUS, &fifo_status, 1);
@@ -545,9 +447,6 @@ static void core1_sensor_loop(void)
         odr_sample_count += n;
 
         // ---- Periodic SPI link check (DEVID re-read) ----
-        // No per-sample CRC exists on this chip, so instead we periodically
-        // confirm the link is still returning the fixed DEVID value. On
-        // mismatch, flag it for the host and re-apply the configuration.
         bool link_fault = false;
         if (++frames_since_check >= LINK_CHECK_INTERVAL) {
             frames_since_check = 0;
@@ -558,8 +457,6 @@ static void core1_sensor_loop(void)
         }
 
         // ---- Build frame ----
-        // Report drops accumulated from prior iterations; reset only once
-        // this report actually makes it into the ring buffer (see below).
         uint16_t dropped_report = (uint16_t)(dropped_pending > 0xFFFFu
                                                   ? 0xFFFFu : dropped_pending);
         frame_header_t hdr = {
@@ -600,7 +497,7 @@ static void core1_sensor_loop(void)
         seq_tx += n;
 
         // ---- Report measured ODR once the window closes ----
-        uint64_t now_us = time_us_64();
+        uint64_t now_us     = time_us_64();
         uint64_t elapsed_us = now_us - odr_window_start_us;
         if (elapsed_us >= ODR_REPORT_INTERVAL_US && odr_sample_count > 0) {
             uint32_t odr_mhz = (uint32_t)((uint64_t)odr_sample_count
@@ -611,8 +508,6 @@ static void core1_sensor_loop(void)
         }
 
         // ---- Adaptive sleep ----
-        // Overrun or FIFO nearly full: no sleep, drain immediately
-        // Otherwise: halved sleep to reduce busy-loop overhead
         if (!overrun && entries <= FIFO_WATERMARK + 4u)
             sleep_us(LOOP_SLEEP_US / 2u);   // 200 -> 100 us
     }
@@ -623,9 +518,9 @@ static void core1_sensor_loop(void)
 // ===========================================================================
 int main(void)
 {
-    // TinyUSB init (replaces stdio_init_all + stdio_usb)
-    // Requires usb_descriptors.c + tusb_config.h
-    tusb_init();
+    // Stock SDK USB CDC — the path proven to enumerate on this board.
+    stdio_init_all();
+    stdio_set_translate_crlf(&stdio_usb, false);   // binary framing must pass through
 
     // SPI + GPIO init
     spi_init(SPI_PORT, 5000u * 1000u);  // 5 MHz
@@ -637,20 +532,11 @@ int main(void)
     gpio_set_dir(PIN_CS, GPIO_OUT);
     gpio_put(PIN_CS, 1);
 
-    // Power-on settle: call tud_task() every 1 ms for 100 ms.
-    // USB enumeration starts immediately after tusb_init() — the host sends
-    // SETUP/GET_DESCRIPTOR requests within the first few ms.
-    // A plain sleep_ms(100) would leave those requests unanswered and
-    // cause enumeration failure (no COM port on host side).
-    for (int i = 0; i < 100; i++) {
-        tud_task();
-        sleep_ms(1);
-    }
+    sleep_ms(100);
 
     // ADXL345 config, with a DEVID read-back to catch a dead/miswired SPI
-    // link before we ever start streaming (retry a few times, then proceed
-    // anyway — there is no display to halt on, and periodic checks in the
-    // sensor loop will keep flagging it to the host).
+    // link before streaming starts (retry a few times, then proceed anyway —
+    // periodic checks in the sensor loop keep flagging it to the host).
     for (int attempt = 0; attempt < 3; attempt++) {
         adxl345_configure();
         if (adxl345_link_ok()) break;
@@ -659,7 +545,7 @@ int main(void)
     // Launch Core 1 (sensor read; SPI exclusive to Core 1 from here)
     multicore_launch_core1(core1_sensor_loop);
 
-    // Core 0: USB tight loop — no sleep (tud_task needs frequent calls)
+    // Core 0: USB service loop
     while (true) {
         usb_service();
     }

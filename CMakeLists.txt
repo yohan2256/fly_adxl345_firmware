@@ -11,11 +11,6 @@ pico_sdk_init()
 
 add_executable(fly_adxl345_firmware
     main.c
-    usb_descriptors.c
-)
-
-target_include_directories(fly_adxl345_firmware PRIVATE
-    ${CMAKE_CURRENT_LIST_DIR}
 )
 
 target_link_libraries(fly_adxl345_firmware
@@ -23,12 +18,15 @@ target_link_libraries(fly_adxl345_firmware
     pico_multicore
     pico_bootrom
     hardware_spi
-    tinyusb_device
-    tinyusb_board
 )
 
-# stdio_usb disabled — direct TinyUSB used instead
-pico_enable_stdio_usb(fly_adxl345_firmware 0)
+# Stock SDK USB CDC. Deliberately no tinyusb_device/tinyusb_board here, no
+# usb_descriptors.c, and no tusb_config.h in this directory: pico_stdio_usb
+# supplies its own TinyUSB configuration and descriptors. The custom
+# descriptor set this project previously carried did not enumerate on the
+# FLY ADXL345 board — the host saw no device at all — while this stock path
+# is confirmed working on the same board, SDK and toolchain.
+pico_enable_stdio_usb(fly_adxl345_firmware 1)
 pico_enable_stdio_uart(fly_adxl345_firmware 0)
 
 # Generate .uf2 / .bin / .hex / .map
