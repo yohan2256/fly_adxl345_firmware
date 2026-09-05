@@ -29,7 +29,10 @@
  *     so a nominal 3200 Hz constant on the host is wrong by enough to
  *     matter once results scale with fs^2. Core 1 times its own FIFO reads
  *     against the RP2040 crystal (~+/-30 ppm) and reports the true measured
- *     ODR about once a second.
+ *     ODR about once a second. A window in which the sensor lost samples
+ *     (FIFO overrun, or a reconfigure after a link fault) is skipped rather
+ *     than reported, since only popped samples can be counted and the rate
+ *     would come out low.
  *   - Remote bootloader entry: an 8-byte magic sequence (REBOOT_MAGIC)
  *     calls reset_usb_boot(0, 0), re-enumerating as the RP2040 bootrom
  *     PICOBOOT device so a host can flash a new image without BOOTSEL.
@@ -423,6 +426,7 @@ static void core1_sensor_loop(void)
     // jitter.
     uint64_t odr_window_start_us = time_us_64();
     uint32_t odr_sample_count    = 0;
+    bool     odr_window_lost     = false;  // sensor discarded samples this window
 
     while (true) {
         // ---- Poll FIFO status ----
@@ -455,6 +459,15 @@ static void core1_sensor_loop(void)
                 adxl345_configure();
             }
         }
+
+        // Only a window in which every produced sample was also popped can be
+        // timed. On overrun the FIFO discards silently, and adxl345_configure()
+        // flushes it, so the popped count falls short of what the sensor really
+        // produced and the rate would come out low. That error runs one way,
+        // and a low fs biases k' (which scales with fs^2) toward a better
+        // grade, so the window is dropped rather than reported.
+        if (overrun || link_fault)
+            odr_window_lost = true;
 
         // ---- Build frame ----
         uint16_t dropped_report = (uint16_t)(dropped_pending > 0xFFFFu
@@ -499,12 +512,15 @@ static void core1_sensor_loop(void)
         // ---- Report measured ODR once the window closes ----
         uint64_t now_us     = time_us_64();
         uint64_t elapsed_us = now_us - odr_window_start_us;
-        if (elapsed_us >= ODR_REPORT_INTERVAL_US && odr_sample_count > 0) {
-            uint32_t odr_mhz = (uint32_t)((uint64_t)odr_sample_count
-                                           * 1000000000ull / elapsed_us);
-            push_status_frame(odr_mhz);
+        if (elapsed_us >= ODR_REPORT_INTERVAL_US) {
+            if (!odr_window_lost && odr_sample_count > 0) {
+                uint32_t odr_mhz = (uint32_t)((uint64_t)odr_sample_count
+                                               * 1000000000ull / elapsed_us);
+                push_status_frame(odr_mhz);
+            }
             odr_window_start_us = now_us;
             odr_sample_count    = 0;
+            odr_window_lost     = false;
         }
 
         // ---- Adaptive sleep ----
